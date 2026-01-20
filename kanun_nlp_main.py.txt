@@ -1,254 +1,714 @@
 # -*- coding: utf-8 -*-
 """
-KANUN-I ESASÎ (1876 vs 1909-1918) KAVRAMSAL DÖNÜŞÜM ANALİZ YAZILIMI
-===================================================================
-PROJE ADI: NLP-Based Analysis of Conceptual Transformation in the Kanun-i Esasi
-YAZAR: [Adınız Soyadınız]
-TARİH: 2024
-LİSANS: MIT License
+KANUN-I ESASÎ (1876 vs 1909–1918) — MAKALEYLE BİREBİR PARAMETRELİ, AUDIT-READY NLP PIPELINE
+=========================================================================================
 
-AMAÇ:
-Bu yazılım, makalede sunulan metodolojiyi (Bölüm I) ve bulguları (Bölüm II)
-doğrulamak (reproducibility) amacıyla hazırlanmıştır. Kod, dış kütüphane 
-bağımlılığı (scikit-learn vb.) olmadan çalışacak şekilde tasarlanmış 
-yerel bir matematik motoru içerir.
+Bu dosya, makalede yazılı hattı operasyonel parametreler ile "kilitler" ve otomatik belgelendirir.
 
-METODOLOJİK UYUM:
-1. Ön İşleme: OCR temizliği, normalizasyon (şapkalı harf), stop-word eliminasyonu.
-2. Morfoloji: Zemberek kütüphanesinin çıktısını simüle eden kök haritalaması.
-3. Analizler:
-   - Frekans (Tablo 1)
-   - N-Gram (Tablo 2)
-   - Kolokasyon (Tablo 3)
-   - Modalite/Kip (Tablo 4)
-   - Diff/Benzerlik (Tablo 5)
-   - Tematik Kümeleme (Tablo 6)
+Girdi CSV (önerilen):
+  id,version,year,article_no,text
+Opsiyonel:
+  lemma  -> boşlukla ayrılmış lemma tokenları (Zemberek/harici çıktı). Varsa --use_lemma_col.
+
+Çıktılar:
+  Tablo1_Kavram_Frekanslari.csv
+  Tablo2_Ngram_MinFreq2.csv
+  Tablo3_Kolokasyon_LLR_Window5.csv
+  Tablo4_Modalite_Kategori_Sayim.csv
+  Tablo5_Tema_Bazli_Degisiklik_Yogunlugu.csv
+  Ek_Degisen_Maddeler_Listesi.csv
+  Tablo6_KMeans_Kume_Ozetleri.csv
+  PARAMETERS.txt
+  REPRO_REPORT.txt  (golden test opsiyonel)
+
+Golden test (opsiyonel):
+  --golden outputs/golden_metrics.json
+  Bu JSON, beklenen metrikleri içerir; çalıştırınca PASS/FAIL raporu üretir.
+
+Not (makale uyumu):
+  Eğer CSV'de lemma kolonu yoksa betik "heuristic lemma" kullanır.
+  Makalede Zemberek iddiası varsa, %100 uyum için lemma kolonu şarttır.
 """
 
-import re
+import argparse
+import csv
+import difflib
+import json
 import math
+import os
 import random
-from collections import Counter
+import re
+from dataclasses import dataclass
+from collections import Counter, defaultdict
+from typing import Dict, List, Tuple, Optional, Iterable
 
-# =============================================================================
-# 1. VERİ SETİ (YAPILANDIRILMIŞ CORPUS)
-# Not: Telif ve dosya boyutu sınırları nedeniyle, makaledeki temel eğilimleri
-# (Otorite -> Meşrutiyet) temsil eden seçilmiş maddeler kullanılmıştır.
-# =============================================================================
 
-CORPUS = [
-    # --- 1876 DÖNEMİ (OTORİTER, PADİŞAH MERKEZLİ DİL) ---
-    {"id": "1876_1", "year": 1876, "text": "Madde 1: Devlet-i Aliyye-i Osmâniyye padişâh hazretleri tarafından idare olunur."},
-    {"id": "1876_3", "year": 1876, "text": "Madde 3: İrade-i seniyye padişaha aittir, tebaa-i osmaniye ona tabidir."},
-    {"id": "1876_7", "year": 1876, "text": "Madde 7: Sadrazam ve vükelâ, Padişâhın irâde-i seniyyesi ile tâyin olunur."},
-    {"id": "1876_8", "year": 1876, "text": "Madde 8: Padişâhın zâtı mukaddestir, icraatından dolayı mesul tutulamaz."},
-    {"id": "1876_12", "year": 1876, "text": "Madde 12: Matbuat kanun dairesinde serbesttir."},
-    {"id": "1876_113", "year": 1876, "text": "Madde 113: Padişah, emniyeti ihlal edenleri sürgün etmeye muktedirdir."},
+# -----------------------------
+# 0) Demo corpus (CSV yoksa)
+# -----------------------------
+DEMO_CORPUS = [
+    {"id": "1876_1", "version": "1876", "year": 1876, "article_no": "1",
+     "text": "Madde 1: Devlet-i Aliyye-i Osmâniyye padişâh hazretleri tarafından idare olunur."},
+    {"id": "1876_3", "version": "1876", "year": 1876, "article_no": "3",
+     "text": "Madde 3: İrade-i seniyye padişaha aittir, tebaa-i osmaniye ona tabidir."},
+    {"id": "1876_7", "version": "1876", "year": 1876, "article_no": "7",
+     "text": "Madde 7: Sadrazam ve vükelâ, Padişâhın irâde-i seniyyesi ile tâyin olunur."},
+    {"id": "1876_8", "version": "1876", "year": 1876, "article_no": "8",
+     "text": "Madde 8: Padişâhın zâtı mukaddestir, icraatından dolayı mesul tutulamaz."},
+    {"id": "1876_12", "version": "1876", "year": 1876, "article_no": "12",
+     "text": "Madde 12: Matbuat kanun dairesinde serbesttir."},
+    {"id": "1876_113", "version": "1876", "year": 1876, "article_no": "113",
+     "text": "Madde 113: Padişah, emniyeti ihlal edenleri sürgün etmeye muktedirdir."},
 
-    # --- 1909 DÖNEMİ (MEŞRUTİ, MECLİS MERKEZLİ, HUKUKİ DİL) ---
-    {"id": "1909_1", "year": 1909, "text": "Madde 1: Devlet, padişahın onayı ve Meclis-i Mebusan kararı ile yönetilir."},
-    {"id": "1909_3", "year": 1909, "text": "Madde 3: Meclis, kanun lâyihalarını kabul veya reddeder."},
-    {"id": "1909_7", "year": 1909, "text": "Madde 7: Padişah, meclisi feshetme yetkisini ancak Meclis-i Ayan onayı ile kullanır."},
-    {"id": "1909_10", "year": 1909, "text": "Madde 10: Vatandaşların hürriyeti, müsavat ve toplanma hakkı kanun teminatındadır."},
-    {"id": "1909_12", "year": 1909, "text": "Madde 12: Basın hürdür, sansür edilemez."},
-    {"id": "1909_54", "year": 1909, "text": "Madde 54: Kanun teklifi meclis kararı ve heyet-i vükela tasdiki ile olur."}
+    {"id": "1909_1", "version": "1909-1918", "year": 1909, "article_no": "1",
+     "text": "Madde 1: Devlet, padişahın onayı ve Meclis-i Mebusan kararı ile yönetilir."},
+    {"id": "1909_3", "version": "1909-1918", "year": 1909, "article_no": "3",
+     "text": "Madde 3: Meclis, kanun lâyihalarını kabul veya reddeder."},
+    {"id": "1909_7", "version": "1909-1918", "year": 1909, "article_no": "7",
+     "text": "Madde 7: Padişah, meclisi feshetme yetkisini ancak Meclis-i Ayan onayı ile kullanır."},
+    {"id": "1909_10", "version": "1909-1918", "year": 1909, "article_no": "10",
+     "text": "Madde 10: Vatandaşların hürriyeti, müsavat ve toplanma hakkı kanun teminatındadır."},
+    {"id": "1909_12", "version": "1909-1918", "year": 1909, "article_no": "12",
+     "text": "Madde 12: Basın hürdür, sansür edilemez."},
+    {"id": "1909_54", "version": "1909-1918", "year": 1909, "article_no": "54",
+     "text": "Madde 54: Kanun teklifi meclis kararı ve heyet-i vükela tasdiki ile olur."},
 ]
 
-# =============================================================================
-# 2. NLP MOTORU (NORMALİZASYON VE LEMMATIZATION)
-# =============================================================================
 
+# -----------------------------
+# 1) Veri yapısı
+# -----------------------------
+@dataclass
+class Article:
+    id: str
+    version: str
+    year: int
+    article_no: str
+    text: str
+    lemma_tokens: Optional[List[str]] = None
+
+
+# -----------------------------
+# 2) NLP (normalize/stopword/heuristic lemma)
+# -----------------------------
 class OttomanNLP:
     def __init__(self):
-        # Durak kelimeler (Stopwords) - Makale Bölüm 2.1
-        self.stopwords = {'ve', 'ile', 'dahi', 'gibi', 'üzere', 'bir', 'olan', 'ki', 'için', 'tarafından', 'ancak'}
-        
-        # Lemmatizasyon Haritası (Zemberek Simülasyonu) - Makale Bölüm 2.2
+        # Makalede örneklenen + pratik genişletme
+        self.stopwords = {
+            "ve", "ile", "dahi", "gibi", "üzere", "bir", "olan", "ki", "için", "tarafından", "ancak",
+            "madde", "bu", "şu", "o", "da", "de", "ise", "yahut", "veya", "her", "olarak",
+        }
+
+        # Tarihsel lemma map (yer tutucu; lemma kolonu yoksa devreye girer)
         self.lemma_map = {
-            'padişahın': 'padişah', 'hazretleri': 'hazret', 'irade-i': 'irade', 'irâde-i': 'irade',
-            'seniyyesi': 'seniyye', 'tebaa-i': 'tebaa', 'osmaniyenin': 'osmaniye', 
-            'hürriyet-i': 'hürriyet', 'şahsiyesi': 'şahsi', 'mebusan': 'mebusan', 
-            'vatandaşların': 'vatandaş', 'müsavat': 'eşitlik', 'layihalarını': 'layiha',
-            'lâyihalarını': 'layiha', 'devlet-i': 'devlet', 'aliyye-i': 'devlet', 'olunur': 'ol',
-            'feshetme': 'fesih', 'yetkisini': 'yetki', 'kanun': 'kanun', 'idare': 'idare',
-            'vükela': 'vekil', 'vükelâ': 'vekil', 'emniyeti': 'emniyet', 'matbuat': 'basın'
+            "padişahın": "padişah", "padişaha": "padişah", "padişahı": "padişah", "padisah": "padişah",
+            "meclisi": "meclis", "meclis-i": "meclis", "mebusan": "mebusan", "ayan": "ayan",
+            "irade-i": "irade", "irâde-i": "irade", "seniyyesi": "seniyye",
+            "tebaa-i": "tebaa", "osmaniyye": "osmaniye",
+            "matbuat": "basın", "sansür": "sansür", "sansur": "sansür",
+            "müsavat": "eşitlik", "musavat": "eşitlik",
+            "lâyiha": "layiha", "lâyihalarını": "layiha", "layihalarını": "layiha",
+            "vükela": "vekil", "vükelâ": "vekil",
+            "tasdiki": "tasdik", "onayı": "onay",
+            "olunur": "ol", "olur": "ol",
+            "feshetme": "fesih",
         }
-        
-        # Modalite Regex Kalıpları - Makale Tablo 4
+
+        self.suffixes = [
+            "larının", "lerinin", "larından", "lerinden", "ları", "leri",
+            "nın", "nin", "nun", "nün", "ın", "in", "un", "ün",
+            "na", "ne", "ya", "ye", "dan", "den", "tan", "ten",
+            "dır", "dir", "dur", "dür", "tır", "tir", "tur", "tür",
+        ]
+
+        # Modalite (kategoriler)
         self.modality_patterns = {
-            'Otorite/Emir': [r'irade-?i?\s+seniyye', r'tayin\s+olunur', r'idare\s+olunur', r'emir', r'muktedir'],
-            'İzin/Onay': [r'kabul', r'tasdik', r'onay', r'karar', r'meclis\s+kararı'],
-            'Yasak/Hak': [r'memnu', r'yasak', r'mesul\s+tutulamaz', r'sansür\s+edilemez', r'hürdür']
+            "Yetki/Emir-İşlem": [
+                r"\bbâ[- ]?irâde[- ]?i[- ]?seniyye\b",
+                r"\bba[- ]?irade[- ]?i[- ]?seniyye\b",
+                r"\btayin olunur\b",
+                r"\bicra olunur\b",
+                r"\bifa eyler\b",
+                r"\bmuktedir\b",
+                r"\bfes(h|ih|het)\b",
+            ],
+            "İzin/Onay": [
+                r"\bkabul olunur\b",
+                r"\btasdik\b",
+                r"\bonay\b",
+                r"\bserbest(tir)?\b",
+                r"\bbuyrul(ur|mak)\b",
+                r"\bmezundur\b",
+            ],
+            "Yasaklama/Askı": [
+                r"\bmemnu\b",
+                r"\bmuvakkat(en)?\b",
+                r"\btatil\b",
+                r"\bsansur edilemez\b",
+                r"\bsansür edilemez\b",
+            ],
         }
 
-    def normalize(self, text):
-        """Makale: 'Yazım ve karakter tutarsızlıkları giderilerek...'"""
-        text = text.lower()
-        replacements = {'â': 'a', 'î': 'i', 'û': 'u', 'ô': 'o'}
-        for src, target in replacements.items():
-            text = text.replace(src, target)
-        text = re.sub(r'[^\w\s-]', '', text)
-        return text
+    def normalize(self, text: str) -> str:
+        t = text.lower()
+        for a, b in {"â": "a", "î": "i", "û": "u", "ô": "o", "’": "'", "“": '"', "”": '"'}.items():
+            t = t.replace(a, b)
+        # terkip normalizasyonu
+        t = t.replace("kanun-ı", "kanun i").replace("devlet-i", "devlet i").replace("tebaa-i", "tebaa i")
+        t = t.replace("irade-i", "irade i").replace("irâde-i", "irade i")
+        # noktalama/sayı temizliği
+        t = re.sub(r"[^0-9a-zçğıöşü\s'-]", " ", t)
+        t = re.sub(r"\s+", " ", t).strip()
+        return t
 
-    def preprocess(self, text):
-        """Tokenizasyon ve Kök Bulma"""
-        clean_text = self.normalize(text)
-        tokens = clean_text.split()
-        processed = [self.lemma_map.get(t, t) for t in tokens if t not in self.stopwords]
-        return processed, clean_text
+    def _strip_suffix(self, tok: str) -> str:
+        for suf in self.suffixes:
+            if tok.endswith(suf) and len(tok) > len(suf) + 2:
+                return tok[:-len(suf)]
+        return tok
 
-    def get_ngrams(self, tokens, n=2):
-        return [' '.join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
-
-    def get_context(self, all_tokens, target_word, window=3):
-        contexts = []
-        for i, word in enumerate(all_tokens):
-            if word == target_word:
-                left = all_tokens[max(0, i-window):i]
-                right = all_tokens[i+1:min(len(all_tokens), i+window+1)]
-                contexts.extend(left + right)
-        return Counter(contexts).most_common(5)
-
-# =============================================================================
-# 3. NATIVE MATH ENGINE (KÜTÜPHANE BAĞIMSIZ HESAPLAMA)
-# Scikit-learn gerektirmeden TF-IDF, Cosine Sim ve K-Means hesaplar.
-# =============================================================================
-
-class NativeMathEngine:
-    @staticmethod
-    def compute_tf_idf(docs_tokens):
-        """Makale Yöntem Bölümü: TF-IDF Vektörleştirme"""
-        vocab = sorted(list(set(token for doc in docs_tokens for token in doc)))
-        vocab_index = {w: i for i, w in enumerate(vocab)}
-        N = len(docs_tokens)
-        
-        idf = {}
-        for word in vocab:
-            doc_count = sum(1 for doc in docs_tokens if word in doc)
-            idf[word] = math.log(N / (1 + doc_count))
-            
-        vectors = []
-        for doc in docs_tokens:
-            vec = [0] * len(vocab)
-            term_counts = Counter(doc)
-            total_terms = len(doc) if len(doc) > 0 else 1
-            for word, count in term_counts.items():
-                vec[vocab_index[word]] = (count / total_terms) * idf[word]
-            vectors.append(vec)
-        return vectors, vocab
+    def tokenize_and_lemma(self, text: str) -> Tuple[List[str], str]:
+        clean = self.normalize(text)
+        raw = clean.split()
+        out: List[str] = []
+        for tok in raw:
+            if tok in self.stopwords:
+                continue
+            if tok in self.lemma_map:
+                lem = self.lemma_map[tok]
+            else:
+                tok2 = self._strip_suffix(tok)
+                lem = self.lemma_map.get(tok2, tok2)
+            if lem and lem not in self.stopwords:
+                out.append(lem)
+        return out, clean
 
     @staticmethod
-    def cosine_similarity(vec1, vec2):
-        """Makale Tablo 5: Metin Benzerlik Analizi"""
-        dot_product = sum(a * b for a, b in zip(vec1, vec2))
-        norm_a = math.sqrt(sum(a * a for a in vec1))
-        norm_b = math.sqrt(sum(b * b for b in vec2))
-        return dot_product / (norm_a * norm_b) if norm_a > 0 and norm_b > 0 else 0.0
+    def ngrams(tokens: List[str], n: int) -> List[str]:
+        if n <= 0 or len(tokens) < n:
+            return []
+        return [" ".join(tokens[i:i+n]) for i in range(len(tokens)-n+1)]
 
-    @staticmethod
-    def simple_kmeans(vectors, k=3):
-        """Makale Tablo 6: K-Means Tematik Kümeleme"""
-        random.seed(42) # Tekrar üretilebilirlik için sabit seed
-        centroids = random.sample(vectors, k)
-        clusters = [[] for _ in range(k)]
-        
-        # Basit tek iterasyonluk atama (Gösterim amaçlı)
-        for i, vec in enumerate(vectors):
-            distances = [math.dist(vec, c) for c in centroids]
-            cluster_idx = distances.index(min(distances))
-            clusters[cluster_idx].append(i)
-        return clusters
 
-# =============================================================================
-# 4. ANALİZ YÖNETİCİSİ VE RAPORLAMA
-# =============================================================================
+# -----------------------------
+# 3) Kolokasyon: LLR (pencere-olayı)
+# -----------------------------
+def _llr_2x2(k11: int, k12: int, k21: int, k22: int) -> float:
+    def slog(x: float) -> float:
+        return math.log(x) if x > 0 else 0.0
 
-def run_analysis():
-    nlp = OttomanNLP()
-    
-    # Veri İşleme
-    processed_docs = []
-    tokens_1876 = []
-    tokens_1909 = []
-    
-    print(f"{'='*70}")
-    print(f"KANUN-I ESASÎ ANALİZ RAPORU (REPRODUCIBILITY CHECK)")
-    print(f"Veri Seti: {len(CORPUS)} Madde | Yöntem: Native Python Math Engine")
-    print(f"{'='*70}\n")
+    N = k11 + k12 + k21 + k22
+    if N == 0:
+        return 0.0
+    row1 = k11 + k12
+    row2 = k21 + k22
+    col1 = k11 + k21
+    col2 = k12 + k22
+    E11 = row1 * col1 / N
+    E12 = row1 * col2 / N
+    E21 = row2 * col1 / N
+    E22 = row2 * col2 / N
+    ll = 0.0
+    for k, E in [(k11, E11), (k12, E12), (k21, E21), (k22, E22)]:
+        if k > 0 and E > 0:
+            ll += k * slog(k / E)
+    return 2.0 * ll
 
-    for item in CORPUS:
-        tokens, clean_text = nlp.preprocess(item['text'])
-        doc_data = {
-            'year': item['year'],
-            'tokens': tokens,
-            'text': item['text'],
-            'clean_text': clean_text
-        }
-        processed_docs.append(doc_data)
-        
-        if item['year'] == 1876:
-            tokens_1876.extend(tokens)
+
+def collocations_llr_window_events(tokens: List[str], target: str, window: int = 5, topn: int = 15) -> List[Tuple[str, float, int]]:
+    if not tokens:
+        return []
+    windows: List[set] = []
+    for i in range(len(tokens)):
+        left = max(0, i - window)
+        right = min(len(tokens), i + window + 1)
+        windows.append(set(tokens[left:right]))
+
+    T = len(windows)
+    if T == 0:
+        return []
+    target_presence = [1 if target in s else 0 for s in windows]
+    target_windows = sum(target_presence)
+    if target_windows == 0:
+        return []
+
+    candidates = Counter()
+    for s in windows:
+        if target in s:
+            for w in s:
+                if w != target:
+                    candidates[w] += 1
+
+    results: List[Tuple[str, float, int]] = []
+    for w in candidates.keys():
+        w_presence = [1 if w in s else 0 for s in windows]
+        w_windows = sum(w_presence)
+        k11 = sum(1 for tp, wp in zip(target_presence, w_presence) if tp == 1 and wp == 1)
+        k12 = target_windows - k11
+        k21 = w_windows - k11
+        k22 = T - (k11 + k12 + k21)
+        score = _llr_2x2(k11, k12, k21, k22)
+        results.append((w, score, k11))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:topn]
+
+
+# -----------------------------
+# 4) TF-IDF + KMeans
+# -----------------------------
+def tf_idf_matrix(docs: List[List[str]]) -> Tuple[List[List[float]], List[str]]:
+    vocab = sorted(set(tok for d in docs for tok in d))
+    idx = {w: i for i, w in enumerate(vocab)}
+    N = len(docs)
+    df = Counter()
+    for d in docs:
+        for w in set(d):
+            df[w] += 1
+    idf = {w: math.log((N + 1) / (df[w] + 1)) + 1.0 for w in vocab}  # smoothing
+    mat: List[List[float]] = []
+    for d in docs:
+        tf = Counter(d)
+        denom = float(len(d)) if d else 1.0
+        vec = [0.0] * len(vocab)
+        for w, c in tf.items():
+            vec[idx[w]] = (c / denom) * idf[w]
+        mat.append(vec)
+    return mat, vocab
+
+
+def kmeans(vectors: List[List[float]], k: int, seed: int = 42, max_iter: int = 60) -> List[int]:
+    if not vectors:
+        return []
+    n = len(vectors)
+    dim = len(vectors[0])
+    rnd = random.Random(seed)
+    k = min(k, n)
+    centroids = [vectors[i][:] for i in rnd.sample(range(n), k)]
+    labels = [0] * n
+
+    def dist2(v, c):
+        return sum((v[i] - c[i]) ** 2 for i in range(dim))
+
+    for _ in range(max_iter):
+        changed = False
+        for i, v in enumerate(vectors):
+            best = 0
+            best_d = dist2(v, centroids[0])
+            for j in range(1, k):
+                d = dist2(v, centroids[j])
+                if d < best_d:
+                    best_d = d
+                    best = j
+            if labels[i] != best:
+                labels[i] = best
+                changed = True
+
+        sums = [[0.0] * dim for _ in range(k)]
+        counts = [0] * k
+        for lab, v in zip(labels, vectors):
+            counts[lab] += 1
+            for d in range(dim):
+                sums[lab][d] += v[d]
+        for j in range(k):
+            if counts[j] == 0:
+                centroids[j] = vectors[rnd.randrange(n)][:]  # re-seed
+            else:
+                centroids[j] = [s / counts[j] for s in sums[j]]
+        if not changed:
+            break
+    return labels
+
+
+def top_terms_for_cluster(vectors: List[List[float]], labels: List[int], vocab: List[str], cid: int, topn: int = 12) -> List[str]:
+    idxs = [i for i, lab in enumerate(labels) if lab == cid]
+    if not idxs:
+        return []
+    dim = len(vocab)
+    mean = [0.0] * dim
+    for i in idxs:
+        v = vectors[i]
+        for d in range(dim):
+            mean[d] += v[d]
+    mean = [x / len(idxs) for x in mean]
+    pairs = list(zip(vocab, mean))
+    pairs.sort(key=lambda x: x[1], reverse=True)
+    return [t for t, w in pairs[:topn] if w > 0]
+
+
+# -----------------------------
+# 5) Diff + Tema
+# -----------------------------
+THEME_KEYWORDS = {
+    "Yürütme": {"padişah", "irade", "sadrazam", "vekil", "hükûmet", "hukumet", "icra", "fesih", "tasdik", "onay"},
+    "Yasama": {"meclis", "mebusan", "ayan", "kanun", "layiha", "kabul", "ret", "muvazene", "madde"},
+    "Yargı": {"mahkeme", "muhakeme", "hakim", "yargı", "ceza", "dava"},
+    "Hak ve Hürriyetler": {"hak", "hürriyet", "hurriyet", "eşitlik", "vatandaş", "tebaa", "toplanma", "dernek", "basın", "sansür"},
+    "Maliye": {"vergi", "maliye", "bütçe", "butce", "muvazene"},
+    "Yerel Yönetim": {"vilayet", "liva", "kaza", "nahiye", "belediye"},
+    "Olağanüstü Hâl": {"sürgün", "emniyet", "tatil", "muvakkat", "muktedir"},
+    "Genel Hükümler": {"devlet", "esasi", "umumi", "genel", "teşkilat", "teskilat"},
+}
+
+
+def classify_theme(tokens: List[str]) -> str:
+    s = set(tokens)
+    best = "Genel Hükümler"
+    best_score = 0
+    for theme, kws in THEME_KEYWORDS.items():
+        score = len(s.intersection(kws))
+        if score > best_score:
+            best_score = score
+            best = theme
+    return best
+
+
+def jaccard_set(a: Iterable[str], b: Iterable[str]) -> float:
+    sa, sb = set(a), set(b)
+    if not sa and not sb:
+        return 1.0
+    inter = len(sa.intersection(sb))
+    union = len(sa.union(sb))
+    return inter / union if union else 0.0
+
+
+def seq_ratio(a: str, b: str) -> float:
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+# -----------------------------
+# 6) IO yardımcıları
+# -----------------------------
+def ensure_dir(p: str) -> None:
+    os.makedirs(p, exist_ok=True)
+
+
+def write_csv(path: str, header: List[str], rows: List[List[object]]) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(header)
+        w.writerows(rows)
+
+
+def read_articles_csv(path: str, use_lemma_col: bool) -> List[Article]:
+    arts: List[Article] = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        required = {"id", "version", "year", "article_no", "text"}
+        missing = required - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"CSV eksik kolon(lar): {sorted(missing)}. Gerekli: {sorted(required)}")
+
+        for row in reader:
+            lemma_tokens = None
+            if use_lemma_col and "lemma" in (reader.fieldnames or []) and (row.get("lemma") or "").strip():
+                lemma_tokens = row["lemma"].split()
+
+            arts.append(
+                Article(
+                    id=row["id"].strip(),
+                    version=row["version"].strip(),
+                    year=int(row["year"]),
+                    article_no=row["article_no"].strip(),
+                    text=row["text"].strip(),
+                    lemma_tokens=lemma_tokens,
+                )
+            )
+    return arts
+
+
+def write_text(path: str, text: str) -> None:
+    ensure_dir(os.path.dirname(path) or ".")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
+
+# -----------------------------
+# 7) Golden test (opsiyonel)
+# -----------------------------
+def repro_check(outdir: str, observed: Dict[str, object], golden_path: str) -> None:
+    report_lines = []
+    ok = True
+    try:
+        with open(golden_path, "r", encoding="utf-8") as f:
+            golden = json.load(f)
+    except Exception as e:
+        write_text(os.path.join(outdir, "REPRO_REPORT.txt"), f"Golden okunamadı: {e}\n")
+        return
+
+    report_lines.append("REPRODUCIBILITY CHECK (OBSERVED vs GOLDEN)")
+    report_lines.append("=" * 70)
+
+    for key, gval in golden.items():
+        oval = observed.get(key)
+        if oval != gval:
+            ok = False
+            report_lines.append(f"[FAIL] {key}: observed={oval} | golden={gval}")
         else:
-            tokens_1909.extend(tokens)
+            report_lines.append(f"[PASS] {key}: {oval}")
 
-    # --- TABLO 1: KELİME VE KAVRAM SIKLIĞI ---
-    print(f">>> [TABLO 1] KELİME FREKANSLARI VE DEĞİŞİM")
-    freq_1876 = Counter(tokens_1876)
-    freq_1909 = Counter(tokens_1909)
-    target_words = ['padişah', 'meclis', 'kanun', 'tebaa', 'vatandaş']
-    
-    print(f"{'KAVRAM':<12} {'1876':<8} {'1909':<8} {'DEĞİŞİM YÖNÜ'}")
-    print("-" * 50)
-    for w in target_words:
-        c1 = freq_1876[w]
-        c2 = freq_1909[w]
-        diff = "AZALDI" if c1 > c2 else ("ARTTI" if c2 > c1 else "SABİT")
-        print(f"{w.upper():<12} {c1:<8} {c2:<8} {diff}")
-    print("\n")
+    report_lines.append("-" * 70)
+    report_lines.append("RESULT: " + ("PASS" if ok else "FAIL"))
+    write_text(os.path.join(outdir, "REPRO_REPORT.txt"), "\n".join(report_lines) + "\n")
 
-    # --- TABLO 2 & 3: N-GRAM VE KOLOKASYON ---
-    print(f">>> [TABLO 2/3] N-GRAM VE KOLOKASYON")
-    bigrams_1876 = nlp.get_ngrams(tokens_1876, 2)
-    print(f"1876 Yaygın İkililer: {Counter(bigrams_1876).most_common(3)}")
-    colloc_padisah = nlp.get_context(tokens_1876 + tokens_1909, 'padişah')
-    print(f"'Padişah' Bağlamı: {[x[0] for x in colloc_padisah]}")
-    print("\n")
 
-    # --- TABLO 4: MODALİTE ANALİZİ ---
-    print(f">>> [TABLO 4] MODALİTE (OTORİTE DİLİ)")
-    modality_stats = {1876: Counter(), 1909: Counter()}
-    for doc in processed_docs:
-        yr = doc['year']
-        for cat, patterns in nlp.modality_patterns.items():
-            for pat in patterns:
-                if re.search(pat, doc['clean_text']):
-                    modality_stats[yr][cat] += 1
-    
-    print(f"{'KATEGORİ':<20} {'1876':<6} {'1909':<6}")
-    print("-" * 40)
+# -----------------------------
+# 8) Pipeline
+# -----------------------------
+def run_pipeline(
+    articles: List[Article],
+    outdir: str,
+    k: int,
+    seed: int,
+    use_lemma_col: bool,
+    ngram_min_freq: int,
+    colloc_window: int,
+    diff_seq_threshold: float,
+    diff_jacc_threshold: float,
+    golden_path: str,
+) -> None:
+    ensure_dir(outdir)
+    nlp = OttomanNLP()
+
+    by_version: Dict[str, List[Article]] = defaultdict(list)
+    for a in articles:
+        by_version[a.version].append(a)
+
+    if len(by_version) < 2:
+        raise ValueError("En az iki sürüm (version) gerekir: '1876' ve '1909-1918'.")
+
+    v1 = "1876" if "1876" in by_version else sorted(by_version.keys())[0]
+    v2 = "1909-1918" if "1909-1918" in by_version else sorted(by_version.keys())[1]
+
+    tokens_by_article: Dict[str, List[str]] = {}
+    clean_by_article: Dict[str, str] = {}
+    tokens_by_version: Dict[str, List[str]] = {v1: [], v2: []}
+
+    # Token/Lemma üretimi
+    for v in [v1, v2]:
+        for art in by_version[v]:
+            if use_lemma_col and art.lemma_tokens:
+                toks = [t for t in art.lemma_tokens if t and t not in nlp.stopwords]
+                clean = nlp.normalize(art.text)
+            else:
+                toks, clean = nlp.tokenize_and_lemma(art.text)
+            tokens_by_article[art.id] = toks
+            clean_by_article[art.id] = clean
+            tokens_by_version[v].extend(toks)
+
+    # Tablo 1
+    freq1 = Counter(tokens_by_version[v1])
+    freq2 = Counter(tokens_by_version[v2])
+    len1 = max(len(tokens_by_version[v1]), 1)
+    len2 = max(len(tokens_by_version[v2]), 1)
+
+    target_concepts = ["padişah", "meclis", "millet", "devlet", "hak", "tebaa", "vatandaş", "hükûmet", "adalet", "kanun"]
+    rows_t1 = []
+    for w in target_concepts:
+        c1 = freq1[w]
+        c2 = freq2[w]
+        p1 = (c1 / len1) * 10000.0
+        p2 = (c2 / len2) * 10000.0
+        rows_t1.append([w, c1, c2, (c2 - c1), f"{p1:.2f}", f"{p2:.2f}", f"{(p2 - p1):.2f}"])
+
+    write_csv(os.path.join(outdir, "Tablo1_Kavram_Frekanslari.csv"),
+              ["kavram", f"{v1}_count", f"{v2}_count", "delta_count", f"{v1}_per10k", f"{v2}_per10k", "delta_per10k"],
+              rows_t1)
+
+    # Tablo 2 (n=1,2,3; minfreq)
+    def ngram_counts(tokens: List[str], n: int) -> Counter:
+        return Counter(OttomanNLP.ngrams(tokens, n))
+
+    rows_t2 = []
+    for n in (1, 2, 3):
+        c1n = ngram_counts(tokens_by_version[v1], n)
+        c2n = ngram_counts(tokens_by_version[v2], n)
+        all_ngrams = set(c1n.keys()) | set(c2n.keys())
+        filtered = []
+        for ng in all_ngrams:
+            a = c1n.get(ng, 0)
+            b = c2n.get(ng, 0)
+            if max(a, b) >= ngram_min_freq:
+                filtered.append((ng, a, b, b - a))
+        filtered.sort(key=lambda x: (abs(x[3]), x[2] + x[1]), reverse=True)
+        for ng, a, b, d in filtered[:200]:
+            rows_t2.append([f"{n}-gram", ng, a, b, d])
+
+    write_csv(os.path.join(outdir, "Tablo2_Ngram_MinFreq2.csv"),
+              ["ngram_turu", "ngram", f"{v1}_count", f"{v2}_count", "delta"],
+              rows_t2)
+
+    # Tablo 3 (LLR)
+    colloc_targets = ["padişah", "meclis", "kanun", "irade", "zat", "millet", "tebaa", "vatandaş", "hak"]
+    rows_t3 = []
+    for tgt in colloc_targets:
+        c1c = collocations_llr_window_events(tokens_by_version[v1], tgt, window=colloc_window, topn=15)
+        c2c = collocations_llr_window_events(tokens_by_version[v2], tgt, window=colloc_window, topn=15)
+        s1 = "; ".join([f"{w}({score:.1f}|k11={k11})" for w, score, k11 in c1c[:10]])
+        s2 = "; ".join([f"{w}({score:.1f}|k11={k11})" for w, score, k11 in c2c[:10]])
+        rows_t3.append([tgt, s1, s2])
+
+    write_csv(os.path.join(outdir, "Tablo3_Kolokasyon_LLR_Window5.csv"),
+              ["hedef_kavram", f"{v1}_top10_colloc(llr|k11)", f"{v2}_top10_colloc(llr|k11)"],
+              rows_t3)
+
+    # Tablo 4 (modalite)
+    def modality_counts(version: str) -> Dict[str, int]:
+        counts = Counter()
+        for art in by_version[version]:
+            clean = clean_by_article[art.id]
+            for cat, pats in nlp.modality_patterns.items():
+                if any(re.search(pat, clean) for pat in pats):
+                    counts[cat] += 1
+        return dict(counts)
+
+    m1 = modality_counts(v1)
+    m2 = modality_counts(v2)
+
+    rows_t4 = []
     for cat in nlp.modality_patterns.keys():
-        print(f"{cat:<20} {modality_stats[1876][cat]:<6} {modality_stats[1909][cat]:<6}")
-    print("\n")
+        rows_t4.append([cat, m1.get(cat, 0), m2.get(cat, 0), m2.get(cat, 0) - m1.get(cat, 0)])
 
-    # --- TABLO 5: MADDE BAZLI FARK ANALİZİ ---
-    print(f">>> [TABLO 5] KAVRAMSAL DÖNÜŞÜM (DIFF/COSINE SIMILARITY)")
-    vecs, _ = NativeMathEngine.compute_tf_idf([tokens_1876, tokens_1909])
-    similarity = NativeMathEngine.cosine_similarity(vecs[0], vecs[1])
-    print(f"Metin Benzerlik Oranı: %{similarity*100:.2f}")
-    print(f"Kavramsal Farklılaşma: %{(1.0 - similarity) * 100:.2f}")
-    print("\n")
+    write_csv(os.path.join(outdir, "Tablo4_Modalite_Kategori_Sayim.csv"),
+              ["kategori", f"{v1}_madde_sayisi", f"{v2}_madde_sayisi", "delta"],
+              rows_t4)
 
-    # --- TABLO 6: TEMATİK KÜMELEME ---
-    print(f">>> [TABLO 6] TEMATİK KÜMELEME (K-MEANS)")
-    all_docs_tokens = [d['tokens'] for d in processed_docs]
-    tfidf_vecs, _ = NativeMathEngine.compute_tf_idf(all_docs_tokens)
-    clusters = NativeMathEngine.simple_kmeans(tfidf_vecs, k=3)
-    
-    labels = ["KÜME 1 (OTORİTE)", "KÜME 2 (MEŞRUTİYET)", "KÜME 3 (HAKLAR)"]
-    for i, idx_list in enumerate(clusters):
-        print(f"--- {labels[i] if i<3 else 'DİĞER'} ---")
-        for idx in idx_list[:2]:
-            print(f"  * [{processed_docs[idx]['year']}] {processed_docs[idx]['text'][:60]}...")
+    # Tablo 5 (diff + tema)
+    map1 = {a.article_no: a for a in by_version[v1]}
+    map2 = {a.article_no: a for a in by_version[v2]}
+
+    def sort_key_article_no(x: str):
+        return (int(x) if x.isdigit() else 10**9, x)
+
+    changed = []
+    new = []
+    removed = []
+    for no in sorted(set(map1) | set(map2), key=sort_key_article_no):
+        a1 = map1.get(no)
+        a2 = map2.get(no)
+        if a1 and a2:
+            s = seq_ratio(a1.text, a2.text)
+            j = jaccard_set(tokens_by_article[a1.id], tokens_by_article[a2.id])
+            if (s < diff_seq_threshold) or (j < diff_jacc_threshold):
+                changed.append((no, s, j, a1.id, a2.id))
+        elif (not a1) and a2:
+            new.append(no)
+        elif a1 and (not a2):
+            removed.append(no)
+
+    theme_stats = {t: {"total_1876": 0, "changed": 0, "new": 0, "removed": 0} for t in THEME_KEYWORDS.keys()}
+
+    for art in by_version[v1]:
+        theme_stats[classify_theme(tokens_by_article[art.id])]["total_1876"] += 1
+    for no, s, j, id1, id2 in changed:
+        theme_stats[classify_theme(tokens_by_article[id1])]["changed"] += 1
+    for no in new:
+        theme_stats[classify_theme(tokens_by_article[map2[no].id])]["new"] += 1
+    for no in removed:
+        theme_stats[classify_theme(tokens_by_article[map1[no].id])]["removed"] += 1
+
+    rows_t5 = []
+    for theme, d in theme_stats.items():
+        total = d["total_1876"]
+        affected = d["changed"] + d["new"] + d["removed"]
+        pct = (affected / total * 100.0) if total > 0 else 0.0
+        rows_t5.append([theme, total, d["changed"], d["new"], d["removed"], f"{pct:.1f}%"])
+
+    write_csv(os.path.join(outdir, "Tablo5_Tema_Bazli_Degisiklik_Yogunlugu.csv"),
+              ["tema", f"{v1}_madde_sayisi", f"{v2}_degisen_madde", f"{v2}_yeni_madde", f"{v2}_kaldirilan_madde", "toplam_etkilenen_yuzde"],
+              rows_t5)
+
+    write_csv(os.path.join(outdir, "Ek_Degisen_Maddeler_Listesi.csv"),
+              ["article_no", "seq_ratio", "jaccard_lemma_set", "id_1876", "id_1909_1918"],
+              [[no, f"{s:.4f}", f"{j:.4f}", id1, id2] for (no, s, j, id1, id2) in changed])
+
+    # Tablo 6 (TF-IDF + KMeans)
+    all_articles = by_version[v1] + by_version[v2]
+    docs = [tokens_by_article[a.id] for a in all_articles]
+    X, vocab = tf_idf_matrix(docs)
+    labels = kmeans(X, k=k, seed=seed, max_iter=60)
+
+    rows_t6 = []
+    for cid in range(min(k, len(all_articles))):
+        top_terms = top_terms_for_cluster(X, labels, vocab, cid, topn=12)
+        c_v1 = sum(1 for a, lab in zip(all_articles, labels) if lab == cid and a.version == v1)
+        c_v2 = sum(1 for a, lab in zip(all_articles, labels) if lab == cid and a.version == v2)
+        rows_t6.append([cid + 1, c_v1, c_v2, ", ".join(top_terms)])
+
+    write_csv(os.path.join(outdir, "Tablo6_KMeans_Kume_Ozetleri.csv"),
+              ["kume_no", f"{v1}_madde_sayisi", f"{v2}_madde_sayisi", "top_terimler"],
+              rows_t6)
+
+    # PARAMETERS.txt
+    params = {
+        "version_1": v1,
+        "version_2": v2,
+        "use_lemma_col": use_lemma_col,
+        "ngram_n_values": [1, 2, 3],
+        "ngram_min_freq": ngram_min_freq,
+        "collocation_window_tokens": colloc_window,
+        "collocation_measure": "LLR (sliding window events)",
+        "diff_seq_threshold": diff_seq_threshold,
+        "diff_jacc_threshold": diff_jacc_threshold,
+        "tfidf_idf": "log((N+1)/(df+1)) + 1",
+        "kmeans_k": k,
+        "kmeans_seed": seed,
+        "kmeans_max_iter": 60,
+        "note_alignment": "Makaledeki Zemberek iddiası için CSV lemma kolonu gereklidir.",
+    }
+    write_text(os.path.join(outdir, "PARAMETERS.txt"), json.dumps(params, ensure_ascii=False, indent=2) + "\n")
+
+    # observed metrics (golden test için)
+    observed = {
+        "version_1_articles": len(by_version[v1]),
+        "version_2_articles": len(by_version[v2]),
+        "vocab_size": len(vocab),
+        "changed_count": len(changed),
+        "new_count": len(new),
+        "removed_count": len(removed),
+    }
+    if golden_path:
+        repro_check(outdir, observed, golden_path)
+
+    print("OK — outputs:", os.path.abspath(outdir))
+
+
+# -----------------------------
+# 9) CLI
+# -----------------------------
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", default="", help="CSV yolu (örn. data/kanun_i_esasi_articles.csv)")
+    ap.add_argument("--outdir", default="outputs", help="Çıktı klasörü")
+    ap.add_argument("--k", type=int, default=3, help="KMeans K")
+    ap.add_argument("--seed", type=int, default=42, help="Seed")
+    ap.add_argument("--use_lemma_col", action="store_true", help="CSV lemma kolonu varsa kullan")
+    ap.add_argument("--ngram_min_freq", type=int, default=2, help="Min n-gram frekansı")
+    ap.add_argument("--colloc_window", type=int, default=5, help="Kolokasyon pencere (±token)")
+    ap.add_argument("--diff_seq_threshold", type=float, default=0.95, help="SeqMatcher altı değişti")
+    ap.add_argument("--diff_jacc_threshold", type=float, default=0.80, help="Jaccard altı değişti")
+    ap.add_argument("--golden", default="", help="Golden metrics JSON (opsiyonel)")
+    args = ap.parse_args()
+
+    if args.input and os.path.exists(args.input):
+        articles = read_articles_csv(args.input, use_lemma_col=args.use_lemma_col)
+    else:
+        articles = [Article(**{k: v for k, v in d.items() if k in {"id", "version", "year", "article_no", "text"}}) for d in DEMO_CORPUS]
+
+    run_pipeline(
+        articles=articles,
+        outdir=args.outdir,
+        k=args.k,
+        seed=args.seed,
+        use_lemma_col=args.use_lemma_col,
+        ngram_min_freq=args.ngram_min_freq,
+        colloc_window=args.colloc_window,
+        diff_seq_threshold=args.diff_seq_threshold,
+        diff_jacc_threshold=args.diff_jacc_threshold,
+        golden_path=args.golden,
+    )
+
 
 if __name__ == "__main__":
-    run_analysis()
+    main()
